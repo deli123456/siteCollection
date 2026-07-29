@@ -687,7 +687,8 @@
       if (!state.trackLine) {
         state.trackLine = new AMap.Polyline({
           path: linePath, strokeColor: '#2563eb', strokeWeight: 4,
-          strokeOpacity: 0.9, lineJoin: 'round', zIndex: 50
+          strokeOpacity: 0.9, strokeStyle: 'dashed', strokeDasharray: [10, 6],
+          lineJoin: 'round', zIndex: 50
         });
         state.map.add(state.trackLine);
       } else state.trackLine.setPath(linePath);
@@ -709,7 +710,7 @@
   function injectCpStyle() {
     if (document.getElementById('cpDotStyle')) return;
     const s = document.createElement('style'); s.id = 'cpDotStyle';
-    s.textContent = '.cp-dot{min-width:18px;height:18px;padding:0 3px;border-radius:9px;background:#ef4444;' +
+    s.textContent = '.cp-dot{min-width:18px;height:18px;padding:0 3px;border-radius:9px;background:#2563eb;' +
       'color:#fff;font-size:11px;font-weight:700;line-height:18px;text-align:center;' +
       'border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.3);}';
     document.head.appendChild(s);
