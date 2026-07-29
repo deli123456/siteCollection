@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport"
+        content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="format-detection" content="telephone=no" />
+  <title>站点采集</title>
+  <link rel="stylesheet" href="./style.css" />
+</head>
+<body>
+  <!-- 地图容器 -->
+  <div id="map"></div>
+
+  <!-- 顶部状态栏 -->
+  <header id="statusBar" class="status-bar">
+    <div class="status-item">
+      <span class="dot" id="gpsDot"></span>
+      <span id="gpsText">定位中…</span>
+    </div>
+    <div class="status-item">
+      <span id="accText">精度 --</span>
+    </div>
+    <div class="status-item">
+      <span id="snapText">吸附 --</span>
+    </div>
+  </header>
+
+  <!-- 采集信息面板 -->
+  <section id="infoPanel" class="info-panel">
+    <div class="info-row">
+      <span class="label">已采集</span>
+      <span class="value"><b id="countText">0</b> 点</span>
+    </div>
+    <div class="info-row">
+      <span class="label">当前坐标</span>
+      <span class="value mono" id="curCoord">--</span>
+    </div>
+  </section>
+
+  <!-- 底部操作区 -->
+  <footer class="toolbar">
+    <button id="btnLayer" class="map-ctrl-btn btn-layer-pos" title="卫星/标准地图切换">卫星</button>
+    <button id="btnLocate" class="btn btn-secondary" title="回到当前位置">定位</button>
+    <button id="btnCollect" class="btn btn-primary btn-collect" disabled>采集</button>
+    <button id="btnMenu" class="btn btn-secondary" title="更多">···</button>
+    <div id="modeSwitch" class="mode-switch" title="定位模式切换">
+      <button id="modeAuto" class="mode-opt active">自动</button>
+      <button id="modeManual" class="mode-opt">手动</button>
+    </div>
+  </footer>
+
+  <!-- 更多菜单 -->
+  <div id="mask" class="mask hidden"></div>
+  <div id="sheet" class="sheet hidden">
+    <div class="sheet-title">采集管理</div>
+    <button class="sheet-btn" id="btnList">查看采集列表</button>
+    <button class="sheet-btn" id="btnExportCsv">导出 CSV</button>
+    <button class="sheet-btn" id="btnRoadLevel">采集道路等级</button>
+    <button class="sheet-btn" id="btnUndo">撤销上一个点</button>
+    <button class="sheet-btn danger" id="btnClear">清空全部</button>
+    <button class="sheet-btn" id="btnCloseSheet">关闭</button>
+  </div>
+
+  <!-- 采集道路等级浮动弹层 -->
+  <div id="lvlMask" class="mask hidden"></div>
+  <div id="lvlModal" class="lvl-modal hidden">
+    <div class="nm-header">
+      <span>采集道路等级</span>
+      <button id="lvlClose" class="btn-close">×</button>
+    </div>
+    <div class="lvl-modal-body">
+      <label class="lvl-item"><input type="checkbox" class="lvl-cb" data-lvl="walk" checked><span>🚶 步行道 · 人行道/辅路</span></label>
+      <label class="lvl-item"><input type="checkbox" class="lvl-cb" data-lvl="ride" checked><span>🚲 骑行道 · 自行车/电动车/摩托车</span></label>
+      <label class="lvl-item"><input type="checkbox" class="lvl-cb" data-lvl="drive" checked><span>🚗 机动车道 · 小汽车/主路</span></label>
+      <div class="sheet-hint">勾选后 GPS 自动与手动吸附只会吸附到选中的道路类型；可多选，取最近的一条。</div>
+    </div>
+  </div>
+
+  <!-- 采集列表弹层 -->
+  <div id="listPanel" class="list-panel hidden">
+    <div class="list-header">
+      <span>采集列表</span>
+      <button id="btnCloseList" class="btn-close">×</button>
+    </div>
+    <div id="listBody" class="list-body"></div>
+  </div>
+
+  <!-- Toast -->
+  <div id="toast" class="toast hidden"></div>
+
+  <!-- 站点命名弹层 -->
+  <div id="nameMask" class="mask hidden"></div>
+  <div id="nameModal" class="name-modal hidden">
+    <div class="nm-header">
+      <span>记录站点</span>
+      <button id="nmCancel" class="btn-close">×</button>
+    </div>
+    <div class="nm-coord">
+      <span class="mono" id="nmCoord">--</span>
+      <span class="nm-snap" id="nmSnap">--</span>
+    </div>
+    <input id="nameInput" class="nm-input" type="text"
+           placeholder="输入或从下方选择站点名称" autocomplete="off" />
+    <div class="nm-poi-title">周边推荐<span id="poiTip"></span></div>
+    <div id="poiList" class="nm-poi-list"></div>
+    <div class="nm-actions">
+      <button id="nmConfirm" class="btn btn-primary nm-confirm">确定采集</button>
+    </div>
+  </div>
+
+  <!-- 高德安全密钥配置：必须在加载 JS API 之前设置 -->
+  <script type="text/javascript">
+    window._AMapSecurityConfig = {
+      securityJsCode: '7fa6444b10100ac42cd5ac38a78783a5'
+    };
+  </script>
+  <!-- 高德 JS API 2.0，插件：轨迹纠偏 GraspRoad、POI搜索 PlaceSearch、逆地理编码 Geocoder、路径规划 Driving/Walking/Riding(手动校准吸附用，含辅路/非机动道) -->
+  <script src="https://webapi.amap.com/maps?v=2.0&key=821fb86fa368fb420b8ce764f6ec718d&plugin=AMap.GraspRoad,AMap.PlaceSearch,AMap.Geocoder,AMap.Driving,AMap.Walking,AMap.Riding"></script>
+  <script src="./app.js"></script>
+</body>
+</html>
