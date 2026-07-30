@@ -1,0 +1,167 @@
+{
+  "summary": {
+    "projectName": "siteCollection",
+    "locale": "zh-CN",
+    "modelId": "agent-work-loop-v4",
+    "reportContractVersion": 25,
+    "overview": "小型静态地图采集工具的 Harness 基础尚未建立：仓库没有任何 Agent 指引与机械化验证，变更正确性依赖手工截图；高德 securityJsCode 已随源码提交、部署密码以明文文件管理；部署为直接覆盖远程文件且无验收与回滚路线。本窗口会话证据不足，学习闭环暂无法评估。",
+    "aiAgentPractice": {
+      "inspectedSurfaces": [],
+      "coverageRows": [
+        {
+          "surface": "Rules",
+          "scopes": [
+            "Project"
+          ],
+          "count": 0
+        },
+        {
+          "surface": "Skills",
+          "scopes": [
+            "Project"
+          ],
+          "count": 0
+        },
+        {
+          "surface": "Commands",
+          "scopes": [
+            "Project"
+          ],
+          "count": 0
+        },
+        {
+          "surface": "Hooks",
+          "scopes": [
+            "Project"
+          ],
+          "count": 0
+        },
+        {
+          "surface": "MCP",
+          "scopes": [
+            "Project"
+          ],
+          "count": 0
+        },
+        {
+          "surface": "Custom Agents",
+          "scopes": [
+            "Project"
+          ],
+          "count": 0
+        },
+        {
+          "surface": "Plugins",
+          "scopes": [
+            "Project"
+          ],
+          "count": 0
+        }
+      ]
+    },
+    "assignmentSummaries": [],
+    "dimensions": [
+      {
+        "id": "task-understanding",
+        "label": "任务理解",
+        "score": 45,
+        "summary": "仓库无 README/AGENTS.md/规格文档（证据包 agentInstructions=missing），任务入口、边界与风险只能靠通读源码推断；会话侧无可复核的 Task Episode，行为证据保持 Unobserved。",
+        "findingRefs": [
+          "missing-agent-entrypoint-docs"
+        ]
+      },
+      {
+        "id": "controlled-execution",
+        "label": "可控执行",
+        "score": 42,
+        "summary": "存在可用的部署脚本路线（deploy/run.js、upload.js），但启动/运行方式无文档；权限边界有已核实缺陷：securityJsCode 随源码提交，且仓库无 .gitignore 防止明文 .pwd 被提交。",
+        "findingRefs": [
+          "plaintext-credentials-in-source"
+        ]
+      },
+      {
+        "id": "change-validation",
+        "label": "改动验证",
+        "score": 35,
+        "summary": "0 个测试文件，唯一的 test 脚本是占位符；deploy/ 内 50+ 张手工验证截图表明验证方式为人工浏览器比对，核心算法（吸附/稳定化，app.js 约 974 行）无任何机械化检查。",
+        "findingRefs": [
+          "no-mechanical-validation"
+        ]
+      },
+      {
+        "id": "reliable-delivery",
+        "label": "可靠交付",
+        "score": 38,
+        "summary": "交付边界为 SFTP 直接覆盖生产主机文件并以 root 执行远程命令；静态检查未发现备份、回滚或部署后验证机制；CI 状态按证据边界保持 UNVERIFIED。",
+        "findingRefs": [
+          "no-delivery-acceptance-or-rollback"
+        ]
+      },
+      {
+        "id": "learning-capture",
+        "label": "经验沉淀",
+        "score": 38,
+        "summary": "本窗口 facts 路由在 5 个合格会话中保留 0 个候选 Episode（3 个无请求、1 个自我分析、1 个低信号），学习覆盖多项 not-evaluable/insufficient-episodes；观察边界无法区分重复工作与干净窗口，该证据缺口保留在证据边界内（Unobserved），不作为发现。项目 Skills 为 0，但因无重复流程候选，本轮不提升 Skill 覆盖发现。",
+        "findingRefs": []
+      }
+    ]
+  },
+  "findings": [
+    {
+      "id": "no-mechanical-validation",
+      "title": "代码变更没有任何机械化检查，验证完全依赖手工截图",
+      "severity": "Medium",
+      "reason": "事实：工作区 0 个测试文件；deploy/package.json 的 test 脚本为占位符（echo \"Error: no test specified\"）；deploy/ 目录提交了 50+ 张手工验证截图（step*/test*/verify*.png）。推断：当前验证方式是人工浏览器截图比对，app.js（约 974 行，含吸附/投影/轨迹稳定化算法）的任何变更无法被机械验证，回归只能靠肉眼发现。责任方：项目维护者。不确定性：运行时行为与 CI 状态未验证（静态分析边界）。",
+      "expectedOutput": [
+        "核心算法与部署脚本拥有至少一条可重复运行的机械化检查，变更后可立即获得通过/失败信号。"
+      ],
+      "expectedArtifact": "Focused check",
+      "aiFixPrompt": "/better-harness fix this issue\n\n为 app.js 与 deploy 脚本建立最小机械化检查：先用仓库已有的 Node 运行时执行语法级检查（例如 node --check app.js、node --check deploy/run.js、node --check deploy/upload.js），再把吸附/投影等纯函数（如 projectOnPath、distance、bearing）抽出为可测函数并添加最小单元测试，替换 deploy/package.json 中的占位 test 脚本。不引入未经确认的新框架前先用 Node 内置 node:test。\n\n## Validation\n\n- 运行新增的检查/测试命令并确认全部通过\n- 确认 deploy/package.json 的 test 脚本不再是占位符且可运行",
+      "dimensionRefs": [
+        "change-validation"
+      ]
+    },
+    {
+      "id": "plaintext-credentials-in-source",
+      "title": "高德 securityJsCode 已随源码提交，部署密码以明文文件管理",
+      "severity": "Medium",
+      "reason": "事实：index.html 第 113-119 行硬编码 _AMapSecurityConfig.securityJsCode 与 JS API key，且已随提交 dd529d4 进入 git 历史；deploy/run.js 与 upload.js 从明文 .pwd 文件读取 root 密码（已核实 .pwd 当前未被 git 跟踪）；仓库没有任何 .gitignore。推断：securityJsCode 按高德文档应经代理下发而非明文暴露，泄露可导致配额盗用；.pwd 一旦创建没有任何机制阻止其被提交。责任方：项目维护者。不确定性：密钥当前是否已被滥用不可验证。",
+      "expectedOutput": [
+        "凭据不再以可提交的明文形式存在，泄露过的密钥完成轮换，后续提交有忽略规则兜底。"
+      ],
+      "expectedArtifact": "Config guard",
+      "aiFixPrompt": "/better-harness fix this issue\n\n1) 在仓库根添加 .gitignore，至少忽略 deploy/.pwd；2) 部署密码优先使用脚本已支持的 DEPLOY_PWD 环境变量路线，弃用 .pwd 明文文件；3) 在高德开放平台控制台轮换 securityJsCode 与 key（外部控制台写操作，需你单独授权后执行），并评估以代理方式下发 securityJsCode。不要在报告或提交中粘贴新旧密钥值。\n\n## Validation\n\n- git check-ignore deploy/.pwd 返回命中\n- 确认页面在新密钥下正常加载地图（旧密钥轮换后失效）",
+      "dimensionRefs": [
+        "controlled-execution"
+      ]
+    },
+    {
+      "id": "missing-agent-entrypoint-docs",
+      "title": "仓库没有 README/AGENTS.md，任务入口与运行部署路线不可发现",
+      "severity": "Medium",
+      "reason": "事实：证据包 agentInstructions=missing（建议至少 1 份），readmeTitle 为空，项目描述为空；变更漂移检查另有 1 条 config-setup-docs 类 advisory（配置变更无文档伴随，中置信）。推断：运行方式（静态页面直开）、部署路线（deploy/run.js、upload.js 及目标主机）与验证方式只能靠通读脚本源码推断，Agent 或新成员无权威上下文可用，容易越过预期边界操作生产主机。责任方：项目维护者。",
+      "expectedOutput": [
+        "下一个操作者不读源码即可知道如何运行、部署、验证，以及哪些操作触及生产边界。"
+      ],
+      "expectedArtifact": "Runbook",
+      "aiFixPrompt": "/better-harness fix this issue\n\n在仓库根创建 README.md（项目用途、本地运行方式、部署流程与前置条件、验证方式）和最小 AGENTS.md（代码边界：app.js/index.html/style.css 为核心；deploy/ 涉及生产主机需先获授权；截图为历史验证产物不作为源码）。内容必须与脚本实际行为一致，不虚构不存在的命令。\n\n## Validation\n\n- README.md 与 AGENTS.md 存在于仓库根且被 git 跟踪\n- 文档中的每条命令都能在当前仓库实际执行或明确标注需要的外部前置条件",
+      "dimensionRefs": [
+        "task-understanding"
+      ]
+    },
+    {
+      "id": "no-delivery-acceptance-or-rollback",
+      "title": "部署直接覆盖远程文件，无验收证据与回滚路径",
+      "severity": "Medium",
+      "reason": "事实：deploy/upload.js 通过 SFTP fastPut 直接覆盖远程路径；deploy/run.js 以 root 在生产主机执行任意传入命令；静态检查未发现任何备份、回滚或部署后验证脚本。推断：一次错误上传或错误命令没有可用恢复路线，交付结果也没有任何验收证据留存。责任方：项目维护者。不确定性：远程主机上是否存在带外备份机制不可验证（UNVERIFIED，静态分析边界）。",
+      "expectedOutput": [
+        "每次部署产生一份可回滚的远程备份和一条部署后验证结果，失败时有明确的恢复入口。"
+      ],
+      "expectedArtifact": "Recovery route",
+      "aiFixPrompt": "/better-harness fix this issue\n\n为 deploy 流程补最小恢复路线：在 upload.js 覆盖前先把远程目标文件复制为带时间戳的备份（可复用 run.js 已有的远程命令通道），并新增一步部署后验证（如 curl 远程页面返回 200 与关键内容）。所有远程操作触及生产主机，执行前需你单独授权；本次修复先落地脚本改动，不实际执行远程演练。\n\n## Validation\n\n- 阅读确认备份步骤先于覆盖步骤执行且失败时中止上传\n- （获授权后）演练一次上传→验证→按备份回滚的完整流程并记录结果",
+      "dimensionRefs": [
+        "reliable-delivery"
+      ]
+    }
+  ]
+}
