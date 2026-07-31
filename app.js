@@ -638,7 +638,7 @@
 
   function commitCurrent(pt) {
     state.current = pt;
-    el.snapText.textContent = pt.snapped ? '吸附 ✓' : '吸附 ✗';
+    el.snapText.textContent = pt.snapped ? '吸附道路 ✓' : '吸附道路 ✗';
     el.curCoord.textContent = fmt(pt.lng) + ', ' + fmt(pt.lat);
     el.btnCollect.disabled = false;
     updateLocationVisual(pt, pt.accuracy);
@@ -682,7 +682,7 @@
     } else {
       state.manualRawMarker.setPosition([ll.lng, ll.lat]);
     }
-    el.snapText.textContent = '吸附中…';
+    el.snapText.textContent = '正在吸附道路…';
     manualSnapByRoute(ll);
   }
 
