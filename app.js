@@ -24,9 +24,22 @@
     moveBearingMin: 6,     // 净位移超过此值才信任行进方向(米)
     snapHistorySize: 10,   // 稳定化历史点个数
     snapResetGapMs: 8000,  // 两次吸附间隔超时则重置轨迹(毫秒)
-    autoRouteMinIntervalMs: 1500, // 自动模式重新路径规划最小间隔(节流接口)
-    autoPathStaleMs: 5000, // 缓存道路超过此时长且移动足够则刷新
-    autoPathMaxOffset: 25, // 偏离缓存道路超过此值则重新规划(米)
+    // 候选道路匹配(自动模式多平行道路 map-matching)
+    candRefreshMs: 4000,   // 候选道路刷新最小间隔(毫秒)
+    candAhead: 150,        // 沿行进方向前视距离(米)
+    candLateral: 18,       // 侧向偏移采样距离(米)，用于发现平行主/辅路
+    candSameDist: 8,       // 两候选投影点距离小于此值视为同一条道路(米)
+    candMaxDist: 80,       // 候选道路距离上限(米)
+    trajSimN: 6,           // 轨迹曲线相似度参与的原始GPS点数
+    maxKmh: 200,           // 前后吸附点位移的最大合理速度(km/h)，连通性校验
+    wTraj: 1.0,            // 轨迹曲线相似度权重(米)
+    wHead: 0.6,            // 方向角差权重(度→米折算)
+    stickyBonus: 12,       // 保持当前道路的迟滞加分(米)
+    pinBonus: 40,          // 人工指定道路的优先加分(米)
+    pinMissMax: 2,         // 人工道路连续丢失多少轮后解除
+    altWin: 8,             // 海拔窗口大小
+    altTrendMin: 5,        // 窗口内海拔变化超过此值(米)判定为爬升/下降(立交/隧道)
+    altStickyExtra: 20,    // 垂直变化期间额外的道路保持加分(米)
     storeKey: 'siteCollection.points.v1',
     levelKey: 'siteCollection.roadLevels.v1'
   };
@@ -54,6 +67,7 @@
     btnList: $('btnList'), btnExportCsv: $('btnExportCsv'),
     btnUndo: $('btnUndo'), btnClear: $('btnClear'), btnCloseSheet: $('btnCloseSheet'),
     btnRoadLevel: $('btnRoadLevel'), lvlMask: $('lvlMask'), lvlModal: $('lvlModal'), lvlClose: $('lvlClose'),
+    btnRoadSwitch: $('btnRoadSwitch'),
     listPanel: $('listPanel'), listBody: $('listBody'), btnCloseList: $('btnCloseList'),
     toast: $('toast'),
     nameMask: $('nameMask'), nameModal: $('nameModal'), nmCancel: $('nmCancel'),
@@ -77,10 +91,18 @@
     satelliteOn: false,
     rawWindow: [],
     roadLevels: new Set(ROAD_LEVELS),  // 启用的道路等级(默认全选)
-    autoPath: null,            // 自动模式缓存的道路折线(本地投影用)
-    autoPathTm: 0,             // 缓存道路时间戳
-    autoPathAt: null,          // 上次规划时的位置
-    autoRouteTm: 0,            // 上次发起规划接口的时间戳(节流)
+    // 候选道路匹配状态
+    fusedBrg: null,            // 融合方向角(轨迹方向 + 设备上报方向角)
+    candidates: [],            // 候选道路 [{path, prj, avgTrajDist, score, isCurrent, isPinned}]
+    candTm: 0,                 // 上次候选刷新时间戳
+    curPath: null,             // 当前吸附道路折线
+    pinned: false,             // 人工指定道路生效中
+    pinnedPath: null,          // 人工指定道路折线
+    pinMiss: 0,                // 人工道路连续丢失计数
+    switchIdx: 0,              // 切换道路轮换下标
+    lastSnap: null,            // 上次吸附提交点 {lng,lat,tm}，连通性/速度合理性校验用
+    altWindow: [],             // 最近海拔采样(米)
+    lastAlt: null,             // 最近一次海拔(米)
     snapHistory: [],           // 已接受的吸附点轨迹(用于惯性稳定化)
     roadSwitchVotes: 0,        // 连续横向跳变计数
     lastSnapTm: 0,             // 上次吸附时间戳
@@ -248,6 +270,13 @@
     const c = pos.coords, accuracy = c.accuracy || 999;
     el.accText.textContent = '精度 ' + Math.round(accuracy) + 'm';
 
+    // 海拔采样(供立交/隧道等垂直分离道路的匹配保持参考)
+    if (c.altitude != null && !isNaN(c.altitude)) {
+      state.lastAlt = c.altitude;
+      state.altWindow.push(c.altitude);
+      if (state.altWindow.length > CONFIG.altWin) state.altWindow.shift();
+    }
+
     if (accuracy > CONFIG.minAccuracy) {
       setGps('warn', 'GPS 弱(±' + Math.round(accuracy) + 'm)');
       return;
@@ -333,17 +362,20 @@
     }
     state.roadLevels = next;
     saveLevels();
-    // 等级变化: 清空自动缓存道路，下次吸附按新等级重新规划
-    state.autoPath = null;
-    state.autoPathTm = 0;
-    state.autoPathAt = null;
+    // 等级变化: 重置候选道路与人工指定，下次吸附按新等级重新匹配
+    state.curPath = null; state.candidates = []; state.candTm = 0;
+    state.pinned = false; state.pinnedPath = null; state.pinMiss = 0;
+    updateSwitchBtn();
     const names = { walk: '步行道', ride: '骑行道', drive: '机动车道' };
     const labels = Array.from(state.roadLevels).map((k) => names[k]).join('、');
     toast('吸附道路等级：' + labels, 2200);
   }
 
   // ============================================================
-  // 路网吸附
+  // 路网吸附(自动模式: 候选道路 map-matching)
+  // 思路: 多起点×多引擎短距规划发现附近候选道路(含平行主/辅路)，
+  // 综合评分 = 轨迹曲线相似度 + 方向角匹配 + 连通性速度校验
+  //           + 当前道路迟滞保持(海拔变化期加强) + 人工指定优先
   // ============================================================
   function snapToRoad(accuracy) {
     if (state.manualMode) return;
@@ -353,72 +385,207 @@
       commitCurrent({ lng: rawLast.lng, lat: rawLast.lat, snapped: false, accuracy });
       return;
     }
-    // 仅机动车道: 用 GraspRoad 轨迹纠偏(高效、适合机动车连续行进)
-    const onlyDrive = lv.has('drive') && !lv.has('walk') && !lv.has('ride');
-    if (onlyDrive && state.graspRoad && win.length >= CONFIG.graspMinPoints) {
-      const path = win.map((p) => ({
-        x: p.lng, y: p.lat,
-        sp: Math.round(p.sp * 3.6), ag: Math.round(p.ag), tm: Math.round(p.tm / 1000)
-      }));
-      state.graspRoad.driving(path, (err, result) => {
-        if (state.manualMode) return;
-        if (!err && result && result.data && result.data.points && result.data.points.length) {
-          const pts = result.data.points, last = pts[pts.length - 1];
-          const lng = last.x != null ? last.x : (last.lng != null ? last.lng : last[0]);
-          const lat = last.y != null ? last.y : (last.lat != null ? last.lat : last[1]);
-          const stable = stabilizeSnap({ lng: lng, lat: lat }, rawLast, accuracy);
-          commitCurrent({ lng: stable.lng, lat: stable.lat, snapped: true, accuracy });
-        } else {
-          commitCurrent({ lng: rawLast.lng, lat: rawLast.lat, snapped: false, accuracy });
-        }
-      });
-      return;
-    }
-    // 含非机动车道(或多选): 按选中引擎做路径投影吸附
+    updateFusedBearing(rawLast);
     const engines = enabledEngines();
-    if (engines.length) { autoSnapByEngines(rawLast, accuracy, engines); return; }
-    commitCurrent({ lng: rawLast.lng, lat: rawLast.lat, snapped: false, accuracy });
+    if (!engines.length) { graspFallback(rawLast, accuracy); return; }
+    autoSnapMatch(rawLast, accuracy, engines);
   }
 
-  // 自动模式按选中引擎吸附: 缓存道路本地投影 + 节流刷新(控制接口调用量)
-  function autoSnapByEngines(rawLast, accuracy, engines) {
+  // ---- 方向角融合: 轨迹方向 + GPS模块上报方向角(有速度时才可信) ----
+  function angDiff(a, b) { const d = Math.abs(a - b) % 360; return d > 180 ? 360 - d : d; }
+  function mixAngle(a, b, wa) { // 圆均值(处理 359°/1° 跨界)
+    const rad = Math.PI / 180;
+    const x = Math.cos(a * rad) * wa + Math.cos(b * rad) * (1 - wa);
+    const y = Math.sin(a * rad) * wa + Math.sin(b * rad) * (1 - wa);
+    return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+  }
+  function updateFusedBearing(rawLast) {
+    const tb = trajectoryBearing();
+    let dev = null;
+    if (rawLast && rawLast.ag != null && !isNaN(rawLast.ag) && rawLast.sp > 1.5) dev = rawLast.ag;
+    let brg = null;
+    if (tb != null && dev != null) brg = mixAngle(tb, dev, 0.6); // 轨迹方向权重更高
+    else brg = tb != null ? tb : dev;
+    if (brg == null) return;
+    state.fusedBrg = state.fusedBrg == null ? brg : mixAngle(brg, state.fusedBrg, 0.7); // 平滑
+  }
+
+  // 海拔窗口是否处于明显爬升/下降(立交匠道/隧道口等，此时加强道路保持)
+  function altChanging() {
+    if (state.altWindow.length < 3) return false;
+    return Math.max.apply(null, state.altWindow) - Math.min.apply(null, state.altWindow) >= CONFIG.altTrendMin;
+  }
+
+  // ---- 自动模式候选道路匹配主流程 ----
+  function autoSnapMatch(rawLast, accuracy, engines) {
     const now = Date.now();
-    // 1) 优先用缓存道路本地投影(免接口)
-    if (state.autoPath && state.autoPath.length >= 2) {
-      const prj = projectOnPath(rawLast, state.autoPath);
-      const moved = state.autoPathAt ? distance(state.autoPathAt, rawLast) : 999;
-      const stale = now - state.autoPathTm > CONFIG.autoPathStaleMs;
-      if (prj && prj.dist <= CONFIG.autoPathMaxOffset && !(stale && moved >= 8)) {
-        applyAutoSnap(rawLast, prj, accuracy);
-        return;
-      }
-    }
-    // 2) 需刷新道路: 节流
-    if (now - state.autoRouteTm < CONFIG.autoRouteMinIntervalMs) {
-      if (state.autoPath && state.autoPath.length >= 2) {
-        const prj = projectOnPath(rawLast, state.autoPath);
-        if (prj) { applyAutoSnap(rawLast, prj, accuracy); return; }
+    // 候选未到刷新时间: 直接在当前道路上本地投影(免接口)
+    if (now - state.candTm < CONFIG.candRefreshMs) {
+      if (state.curPath) {
+        const prj = projectOnPath(rawLast, state.curPath);
+        if (prj && prj.dist <= CONFIG.candMaxDist) { commitSnap(prj, accuracy); return; }
       }
       commitCurrent({ lng: rawLast.lng, lat: rawLast.lat, snapped: false, accuracy });
       return;
     }
-    state.autoRouteTm = now;
-    runSnapRound(rawLast, engines, [rawLast.lng + 0.0015, rawLast.lat], (best) => {
+    state.candTm = now;
+    refreshCandidates(rawLast, engines, (cands) => {
       if (state.manualMode) return;
-      if (best && best.dist <= CONFIG.manualSnapMaxDist && best.path) {
-        state.autoPath = best.path;
-        state.autoPathTm = Date.now();
-        state.autoPathAt = { lng: rawLast.lng, lat: rawLast.lat };
-        applyAutoSnap(rawLast, best, accuracy);
+      state.candidates = cands;
+      if (!cands.length) { graspFallback(rawLast, accuracy); updateSwitchBtn(); return; }
+      const best = pickBestCandidate(cands, rawLast);
+      state.curPath = best.path;
+      const prj = projectOnPath(rawLast, best.path) || best.prj;
+      commitSnap(prj, accuracy);
+      updateSwitchBtn();
+    });
+  }
+
+  function commitSnap(prj, accuracy) {
+    state.lastSnap = { lng: prj.point.lng, lat: prj.point.lat, tm: Date.now() };
+    pushSnapHistory(prj.point);
+    commitCurrent({ lng: prj.point.lng, lat: prj.point.lat, snapped: true, accuracy });
+  }
+
+  // 并行发起 多起点×多引擎 短距规划，汇总去重得到附近候选道路(含平行主/辅路)
+  function refreshCandidates(rawLast, engines, done) {
+    const brg = state.fusedBrg;
+    const dest = brg != null ? destPoint(rawLast, brg, CONFIG.candAhead)
+                             : { lng: rawLast.lng + 0.0015, lat: rawLast.lat };
+    const origins = [rawLast];
+    if (brg != null) { // 垂直行进方向左右偏移采样，用于发现旁边的平行道路
+      origins.push(destPoint(rawLast, brg + 90, CONFIG.candLateral));
+      origins.push(destPoint(rawLast, brg - 90, CONFIG.candLateral));
+    }
+    const tasks = [];
+    engines.forEach((eng, ei) => {
+      tasks.push({ eng: eng, o: origins[0] });
+      // 侧向偏移起点仅用第一个引擎(控制接口调用量)
+      if (ei === 0) for (let i = 1; i < origins.length; i++) tasks.push({ eng: eng, o: origins[i] });
+    });
+    let pending = tasks.length;
+    const cands = [];
+    tasks.forEach((t) => {
+      t.eng.search([t.o.lng, t.o.lat], [dest.lng, dest.lat], (status, result) => {
+        if (status === 'complete' && result.routes && result.routes.length) {
+          const path = collectRoutePath(result.routes[0]);
+          if (path.length >= 2) addCandidate(cands, rawLast, path);
+        }
+        if (--pending === 0) done(cands);
+      });
+    });
+  }
+
+  function addCandidate(cands, rawLast, path) {
+    const prj = projectOnPath(rawLast, path);
+    if (!prj || prj.dist > CONFIG.candMaxDist) return;
+    // 去重: 投影点足够近视为同一条道路，保留距离更近的
+    for (let i = 0; i < cands.length; i++) {
+      if (distance(prj.point, cands[i].prj.point) < CONFIG.candSameDist) {
+        if (prj.dist < cands[i].prj.dist) cands[i] = makeCand(path, prj);
+        return;
+      }
+    }
+    cands.push(makeCand(path, prj));
+  }
+
+  function makeCand(path, prj) {
+    // 轨迹曲线相似度: 最近N个原始GPS点到该道路的平均距离(越小越像在这条路上)
+    const pts = state.rawWindow.slice(-CONFIG.trajSimN);
+    let sum = 0, n = 0;
+    pts.forEach((p) => { const pr = projectOnPath(p, path); if (pr) { sum += pr.dist; n++; } });
+    return { path: path, prj: prj, avgTrajDist: n ? sum / n : prj.dist };
+  }
+
+  function pickBestCandidate(cands, rawLast) {
+    const now = Date.now();
+    const altHold = altChanging();
+    const curPrj = state.curPath ? projectOnPath(rawLast, state.curPath) : null;
+    const pinPrj = (state.pinned && state.pinnedPath) ? projectOnPath(rawLast, state.pinnedPath) : null;
+    let pinSeen = false;
+    cands.forEach((c) => {
+      c.isCurrent = !!(curPrj && distance(c.prj.point, curPrj.point) < CONFIG.candSameDist);
+      c.isPinned = !!(pinPrj && distance(c.prj.point, pinPrj.point) < CONFIG.candSameDist * 1.5);
+      if (c.isPinned) pinSeen = true;
+      // 评分(越小越好)
+      let s = c.avgTrajDist * CONFIG.wTraj;                                  // 1) 轨迹曲线相似度
+      if (state.fusedBrg != null && c.prj.segBrg != null)
+        s += angDiff(state.fusedBrg, c.prj.segBrg) * CONFIG.wHead;           // 2) 融合方向角 vs 道路方向
+      if (state.lastSnap) {                                                  // 5) 连通性/速度合理性校验
+        const dt = (now - state.lastSnap.tm) / 1000;
+        if (dt > 0.3) {
+          const kmh = distance(state.lastSnap, c.prj.point) / dt * 3.6;
+          if (kmh > CONFIG.maxKmh) s += 10000; // 达到该点需超合理速度 → 基本排除
+        }
+      }
+      if (c.isCurrent) s -= CONFIG.stickyBonus + (altHold ? CONFIG.altStickyExtra : 0); // 3) 垂直变化期加强保持
+      if (c.isPinned) s -= CONFIG.pinBonus;                                  // 4) 人工指定优先
+      c.score = s;
+    });
+    // 人工指定道路丢失处理(连续丢失若干轮后自动解除)
+    if (state.pinned) {
+      if (pinSeen) state.pinMiss = 0;
+      else if (++state.pinMiss >= CONFIG.pinMissMax) {
+        state.pinned = false; state.pinnedPath = null; state.pinMiss = 0;
+        toast('已离开人工指定道路，恢复自动判断');
+      }
+    }
+    // 人工指定道路仍在场时更新其折线(后续延伸传承)
+    cands.forEach((c) => { if (c.isPinned) state.pinnedPath = c.path; });
+    cands.sort((a, b) => a.score - b.score);
+    return cands[0];
+  }
+
+  // 候选道路全部落空时: 机动车道场景退回 GraspRoad 轨迹纠偏
+  function graspFallback(rawLast, accuracy) {
+    const win = state.rawWindow;
+    if (!(state.roadLevels.has('drive') && state.graspRoad && win.length >= CONFIG.graspMinPoints)) {
+      commitCurrent({ lng: rawLast.lng, lat: rawLast.lat, snapped: false, accuracy });
+      return;
+    }
+    const path = win.map((p) => ({
+      x: p.lng, y: p.lat,
+      sp: Math.round(p.sp * 3.6), ag: Math.round(p.ag), tm: Math.round(p.tm / 1000)
+    }));
+    state.graspRoad.driving(path, (err, result) => {
+      if (state.manualMode) return;
+      if (!err && result && result.data && result.data.points && result.data.points.length) {
+        const pts = result.data.points, last = pts[pts.length - 1];
+        const lng = last.x != null ? last.x : (last.lng != null ? last.lng : last[0]);
+        const lat = last.y != null ? last.y : (last.lat != null ? last.lat : last[1]);
+        const stable = stabilizeSnap({ lng: lng, lat: lat }, rawLast, accuracy);
+        commitCurrent({ lng: stable.lng, lat: stable.lat, snapped: true, accuracy });
       } else {
         commitCurrent({ lng: rawLast.lng, lat: rawLast.lat, snapped: false, accuracy });
       }
     });
   }
 
-  function applyAutoSnap(rawLast, prj, accuracy) {
-    const stable = stabilizeSnap(prj.point, rawLast, accuracy);
-    commitCurrent({ lng: stable.lng, lat: stable.lat, snapped: true, accuracy });
+  // ---- 道路切换按钮(同向多候选时人工快速切换，类似导航主/辅路切换) ----
+  function updateSwitchBtn() {
+    const n = state.candidates.length;
+    const show = !state.manualMode && n >= 2;
+    el.btnRoadSwitch.classList.toggle('hidden', !show);
+    if (show) el.btnRoadSwitch.textContent = '切换道路(' + n + ')';
+  }
+
+  function onRoadSwitch() {
+    const others = state.candidates.filter((c) => !c.isCurrent); // 排除当前已匹配道路
+    if (!others.length) { toast('附近没有其他备选道路'); return; }
+    state.switchIdx = state.switchIdx % others.length;
+    const pick = others[state.switchIdx];
+    state.switchIdx++;
+    // 人工指定: 后续匹配优先保持该道路及其延伸
+    state.pinned = true;
+    state.pinnedPath = pick.path;
+    state.pinMiss = 0;
+    state.curPath = pick.path;
+    state.candidates.forEach((c) => { c.isCurrent = c === pick; });
+    const rawLast = state.rawWindow[state.rawWindow.length - 1];
+    const prj = (rawLast ? projectOnPath(rawLast, pick.path) : null) || pick.prj;
+    commitSnap(prj, state.current ? (state.current.accuracy || 0) : 0);
+    toastRoadName(prj.point, Math.round(prj.dist));
+    vibrate(20);
   }
 
   // 轨迹惯性稳定化: 根据连续历史 GPS 判断当前道路，修正“吸到平行道路”的跳变
@@ -493,9 +660,12 @@
       // 重置自动轨迹，避免切回自动后用陈旧历史判断
       state.snapHistory = [];
       state.roadSwitchVotes = 0;
+      el.btnRoadSwitch.classList.add('hidden');
       toast('手动模式：点击地图选择位置，将自动吸附最近道路', 2600);
     } else {
       if (state.manualRawMarker) { state.map.remove(state.manualRawMarker); state.manualRawMarker = null; }
+      // 切回自动后立即刷新候选道路
+      state.candTm = 0; state.curPath = null; state.lastSnap = null; state.fusedBrg = null;
       toast('已切换为自动定位(GPS)');
     }
   }
@@ -571,7 +741,7 @@
       const lng = p.getLng ? p.getLng() : p.lng, lat = p.getLat ? p.getLat() : p.lat;
       return { x: (lng - pt.lng) * rad * cosLat * R, y: (lat - pt.lat) * rad * R };
     };
-    let bestD = Infinity, bestX = 0, bestY = 0;
+    let bestD = Infinity, bestX = 0, bestY = 0, bestI = 0;
     for (let i = 0; i < path.length - 1; i++) {
       const a = toXY(path[i]), b = toXY(path[i + 1]);
       const dx = b.x - a.x, dy = b.y - a.y;
@@ -580,11 +750,13 @@
       t = Math.max(0, Math.min(1, t));
       const px = a.x + t * dx, py = a.y + t * dy;
       const d = Math.sqrt(px * px + py * py);
-      if (d < bestD) { bestD = d; bestX = px; bestY = py; }
+      if (d < bestD) { bestD = d; bestX = px; bestY = py; bestI = i; }
     }
     if (bestD === Infinity) return null;
+    const norm = (p) => ({ lng: p.getLng ? p.getLng() : p.lng, lat: p.getLat ? p.getLat() : p.lat });
     return {
       dist: bestD,
+      segBrg: bearing(norm(path[bestI]), norm(path[bestI + 1])), // 投影段的道路方向角(行驶方向)
       point: { lng: pt.lng + bestX / (rad * cosLat * R), lat: pt.lat + bestY / (rad * R) }
     };
   }
@@ -821,6 +993,7 @@
       snapped: !!p.snapped,
       source: p.manual ? 'manual' : 'gps',
       accuracy: Math.round(p.accuracy || 0),
+      alt: state.lastAlt != null ? Math.round(state.lastAlt) : null,
       raw: state.lastRaw ? { lng: +fmt(state.lastRaw.lng), lat: +fmt(state.lastRaw.lat) } : null,
       time: new Date().toISOString()
     };
@@ -873,9 +1046,9 @@
   }
   function exportCsv() {
     if (!state.collected.length) { toast('无数据可导出'); return; }
-    const head = 'seq,name,lng,lat,snapped,source,accuracy_m,time\n';
+    const head = 'seq,name,lng,lat,snapped,source,accuracy_m,alt_m,time\n';
     const rows = state.collected.map((p) =>
-      [p.seq, csvCell(p.name), p.lng, p.lat, p.snapped ? 1 : 0, p.source || 'gps', p.accuracy, p.time].join(',')
+      [p.seq, csvCell(p.name), p.lng, p.lat, p.snapped ? 1 : 0, p.source || 'gps', p.accuracy, p.alt == null ? '' : p.alt, p.time].join(',')
     ).join('\n');
     download('points_' + Date.now() + '.csv', '\ufeff' + head + rows, 'text/csv;charset=utf-8');
     toast('CSV 已导出');
@@ -954,6 +1127,7 @@
     el.lvlClose.addEventListener('click', closeLvlModal);
     el.btnUndo.addEventListener('click', () => { toggleSheet(false); undo(); });
     el.btnClear.addEventListener('click', () => { toggleSheet(false); clearAll(); });
+    el.btnRoadSwitch.addEventListener('click', onRoadSwitch);
     el.btnList.addEventListener('click', () => { renderList(); el.listPanel.classList.remove('hidden'); toggleSheet(false); });
     el.btnCloseList.addEventListener('click', () => el.listPanel.classList.add('hidden'));
 
