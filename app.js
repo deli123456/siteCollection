@@ -27,6 +27,7 @@
     // 候选道路匹配(自动模式多平行道路 map-matching)
     candRefreshMs: 4000,   // 候选道路刷新最小间隔(毫秒)
     candAhead: 150,        // 沿行进方向前视距离(米)
+    candBehind: 100,       // 沿行进方向后视距离(米)，保证垂足不落在折线端点
     candLateral: 18,       // 侧向偏移采样距离(米)，用于发现平行主/辅路
     candSameDist: 8,       // 两候选投影点距离小于此值视为同一条道路(米)
     candMaxDist: 80,       // 候选道路距离上限(米)
@@ -113,6 +114,7 @@
     // 图层元素
     satellite: null, roadNet: null,
     locMarker: null, accCircle: null,
+    rawMarker: null,         // 原始GPS点标记(有吸附点时弱化，无吸附点时鲜明)
     manualRawMarker: null,     // 手动点击的原始点(灰)
     trackLine: null, collectMarkers: []
   };
@@ -302,7 +304,7 @@
   function handleGcj(gcj, coords, accuracy) {
     const now = Date.now();
     if (state.lastRaw && distance(state.lastRaw, gcj) < CONFIG.minMoveDist) {
-      updateLocationVisual(state.current || gcj, accuracy);
+      updateRawVisual(gcj, accuracy); // 抖动过滤: 仅刷新原始点视觉
       return;
     }
     let sp = coords.speed;
@@ -319,6 +321,7 @@
     state.lastRaw = point;
     state.rawWindow.push(point);
     if (state.rawWindow.length > CONFIG.windowSize) state.rawWindow.shift();
+    updateRawVisual(gcj, accuracy); // 原始GPS点(弱化色)
     snapToRoad(accuracy);
   }
 
@@ -447,26 +450,29 @@
     commitCurrent({ lng: prj.point.lng, lat: prj.point.lat, snapped: true, accuracy });
   }
 
-  // 并行发起 多起点×多引擎 短距规划，汇总去重得到附近候选道路(含平行主/辅路)
+  // 并行发起 多起点×多引擎×前后双向 短距规划，汇总去重得到附近候选道路(含平行主/辅路)
   function refreshCandidates(rawLast, engines, done) {
     const brg = state.fusedBrg;
-    const dest = brg != null ? destPoint(rawLast, brg, CONFIG.candAhead)
-                             : { lng: rawLast.lng + 0.0015, lat: rawLast.lat };
+    // 前后各规划一段，折线覆盖当前位置前后足够长的道路，避免垂足被钳到端点
+    const destFwd = brg != null ? destPoint(rawLast, brg, CONFIG.candAhead)
+                                : { lng: rawLast.lng + 0.0015, lat: rawLast.lat };
+    const destBack = brg != null ? destPoint(rawLast, (brg + 180) % 360, CONFIG.candBehind) : null;
     const origins = [rawLast];
     if (brg != null) { // 垂直行进方向左右偏移采样，用于发现旁边的平行道路
       origins.push(destPoint(rawLast, brg + 90, CONFIG.candLateral));
       origins.push(destPoint(rawLast, brg - 90, CONFIG.candLateral));
     }
+    const dests = destBack ? [destFwd, destBack] : [destFwd];
     const tasks = [];
     engines.forEach((eng, ei) => {
-      tasks.push({ eng: eng, o: origins[0] });
-      // 侧向偏移起点仅用第一个引擎(控制接口调用量)
-      if (ei === 0) for (let i = 1; i < origins.length; i++) tasks.push({ eng: eng, o: origins[i] });
+      dests.forEach((d) => tasks.push({ eng: eng, o: origins[0], d: d }));
+      // 侧向偏移起点仅用第一个引擎的前向目标(控制接口调用量)
+      if (ei === 0) for (let i = 1; i < origins.length; i++) tasks.push({ eng: eng, o: origins[i], d: destFwd });
     });
     let pending = tasks.length;
     const cands = [];
     tasks.forEach((t) => {
-      t.eng.search([t.o.lng, t.o.lat], [dest.lng, dest.lat], (status, result) => {
+      t.eng.search([t.o.lng, t.o.lat], [t.d.lng, t.d.lat], (status, result) => {
         if (status === 'complete' && result.routes && result.routes.length) {
           const path = collectRoutePath(result.routes[0]);
           if (path.length >= 2) addCandidate(cands, rawLast, path);
@@ -509,8 +515,11 @@
       if (c.isPinned) pinSeen = true;
       // 评分(越小越好)
       let s = c.avgTrajDist * CONFIG.wTraj;                                  // 1) 轨迹曲线相似度
-      if (state.fusedBrg != null && c.prj.segBrg != null)
-        s += angDiff(state.fusedBrg, c.prj.segBrg) * CONFIG.wHead;           // 2) 融合方向角 vs 道路方向
+      if (state.fusedBrg != null && c.prj.segBrg != null) {
+        // 反向规划折线的方向与行进方向相反，取两个方向中较小的夹角
+        const dA = angDiff(state.fusedBrg, c.prj.segBrg);
+        s += Math.min(dA, 360 - dA) * CONFIG.wHead;                          // 2) 融合方向角 vs 道路方向
+      }
       if (state.lastSnap) {                                                  // 5) 连通性/速度合理性校验
         const dt = (now - state.lastSnap.tm) / 1000;
         if (dt > 0.3) {
@@ -661,11 +670,19 @@
       state.snapHistory = [];
       state.roadSwitchVotes = 0;
       el.btnRoadSwitch.classList.add('hidden');
+      // 吸附点立即切为手动主题色(橙色)
+      if (state.locMarker) state.locMarker.setContent('<div class="loc-dot manual"></div>');
       toast('手动模式：点击地图选择位置，将自动吸附最近道路', 2600);
     } else {
       if (state.manualRawMarker) { state.map.remove(state.manualRawMarker); state.manualRawMarker = null; }
-      // 切回自动后立即刷新候选道路
+      // 切回自动: 清空原始点基准与轨迹窗口，第一个GPS回调立即重新匹配吸附附近道路
+      // (否则旧 lastRaw 会让回调永远命中抖动过滤，导致不生成新吸附点)
+      state.lastRaw = null; state.rawWindow = [];
       state.candTm = 0; state.curPath = null; state.lastSnap = null; state.fusedBrg = null;
+      state.pinned = false; state.pinnedPath = null; state.pinMiss = 0;
+      updateSwitchBtn();
+      // 吸附点立即切回自动主题色(蓝色)
+      if (state.locMarker) state.locMarker.setContent('<div class="loc-dot"></div>');
       toast('已切换为自动定位(GPS)');
     }
   }
@@ -675,7 +692,7 @@
     if (!state.manualRawMarker) {
       state.manualRawMarker = new AMap.Marker({
         position: [ll.lng, ll.lat], offset: new AMap.Pixel(-8, -8), zIndex: 80,
-        content: '<div class="raw-dot"></div>'
+        content: '<div class="raw-dot manual"></div>'
       });
       state.map.add(state.manualRawMarker);
       injectRawStyle();
@@ -802,30 +819,25 @@
   }
 
   // ============================================================
-  // 图层渲染
+  // 图层渲染(原始GPS点: 弱化色 / 吸附点: 鲜明色)
   // ============================================================
-  function updateLocationVisual(pt, accuracy) {
-    const pos = [pt.lng, pt.lat];
-    // 吸附成功→蓝色；未吸附→红色，方便一眼识别
-    const content = pt.snapped ? '<div class="loc-dot"></div>' : '<div class="loc-dot unsnap"></div>';
-    if (!state.locMarker) {
-      state.locMarker = new AMap.Marker({
-        position: pos, offset: new AMap.Pixel(-11, -11), zIndex: 100,
-        content: content
+  function updateRawVisual(gcj, accuracy) {
+    const pos = [gcj.lng, gcj.lat];
+    if (!state.rawMarker) {
+      state.rawMarker = new AMap.Marker({
+        position: pos, offset: new AMap.Pixel(-9, -9), zIndex: 95,
+        content: '<div class="raw-dot"></div>'
       });
-      state.map.add(state.locMarker);
-      injectLocStyle();
-    } else {
-      state.locMarker.setPosition(pos);
-      state.locMarker.setContent(content);
-    }
-    // 精度圈(手动/精度为0时隐藏)
-    if (accuracy && accuracy > 0) {
+      state.map.add(state.rawMarker);
+      injectRawStyle();
+    } else state.rawMarker.setPosition(pos);
+    // 精度圈跟随原始点(手动模式/无精度时隐藏)
+    if (accuracy && accuracy > 0 && !state.manualMode) {
       if (!state.accCircle) {
         state.accCircle = new AMap.Circle({
           center: pos, radius: accuracy,
-          strokeColor: '#2563eb', strokeOpacity: 0.3, strokeWeight: 1,
-          fillColor: '#2563eb', fillOpacity: 0.12, zIndex: 40
+          strokeColor: '#94a3b8', strokeOpacity: 0.35, strokeWeight: 1,
+          fillColor: '#94a3b8', fillOpacity: 0.08, zIndex: 40
         });
         state.map.add(state.accCircle);
       } else {
@@ -834,7 +846,57 @@
     } else if (state.accCircle) {
       state.map.remove(state.accCircle); state.accCircle = null;
     }
-    if (state.followMode) state.map.setCenter(pos);
+    fitBoth(); // 原始点位置变化 → 检测是否需要视野适配
+  }
+
+  function updateLocationVisual(pt, accuracy) {
+    if (pt.snapped) {
+      // 吸附成功 → 鲜明吸附点(自动=蓝色主题 / 手动=橙色主题)
+      const pos = [pt.lng, pt.lat];
+      const content = '<div class="loc-dot' + (state.manualMode ? ' manual' : '') + '"></div>';
+      if (!state.locMarker) {
+        state.locMarker = new AMap.Marker({
+          position: pos, offset: new AMap.Pixel(-11, -11), zIndex: 100,
+          content: content
+        });
+        state.map.add(state.locMarker);
+        injectLocStyle();
+      } else {
+        state.locMarker.setPosition(pos);
+        state.locMarker.setContent(content);
+      }
+    } else if (state.locMarker) {
+      // 未吸附 → 隐藏吸附点，只显示原始点(此时原始点用鲜明色)
+      state.map.remove(state.locMarker); state.locMarker = null;
+    }
+    // 只有原始点时切为鲜明色，否则弱化
+    if (state.rawMarker) {
+      const raw = state.rawMarker.getContentEl ? state.rawMarker.getContentEl() : state.rawMarker.dom;
+      if (raw && raw.firstChild) {
+        raw.firstChild.className = state.locMarker ? 'raw-dot' : 'raw-dot bright';
+      }
+    }
+    fitBoth(); // 跟随模式下内部会强制适配，同时容纳原始点与吸附点
+  }
+
+  // 视野自适应适配: 先检测所有GPS点是否已在当前视野内，
+  // 全部在视野内则不动，有点超出才重新适配(避免频繁抢占用户手动缩放);
+  // force=true(定位按钮)或跟随模式下则强制适配，同时容纳原始点与吸附点
+  function fitBoth(force) {
+    if (state.manualMode) return;
+    const arr = [];
+    if (state.rawMarker) arr.push(state.rawMarker);
+    if (state.locMarker) arr.push(state.locMarker);
+    if (!arr.length) return;
+    if (!force && !state.followMode) {
+      const bounds = state.map.getBounds();
+      const allIn = bounds && arr.every((m) => bounds.contains(m.getPosition()));
+      if (allIn) return; // 全部在视野内 → 不做任何调整
+    }
+    state.map.setFitView(arr, true, [120, 60, 160, 60]);
+    const z = state.map.getZoom();
+    if (arr.length < 2) { if (z > 17) state.map.setZoom(17); } // 只有一个点: 避免过度放大
+    else if (z > 19) state.map.setZoom(19); // 两点极近时避免放大过度
   }
 
   function injectLocStyle() {
@@ -842,14 +904,19 @@
     const s = document.createElement('style'); s.id = 'locDotStyle';
     s.textContent = '.loc-dot{width:22px;height:22px;border-radius:50%;background:#2563eb;' +
       'border:3px solid #fff;box-shadow:0 0 0 2px rgba(37,99,235,.5),0 2px 6px rgba(0,0,0,.3);}' +
-      '.loc-dot.unsnap{background:#ef4444;box-shadow:0 0 0 2px rgba(239,68,68,.5),0 2px 6px rgba(0,0,0,.3);}';
+      // 手动模式主题(橙色)
+      '.loc-dot.manual{background:#f97316;box-shadow:0 0 0 2px rgba(249,115,22,.5),0 2px 6px rgba(0,0,0,.3);}';
     document.head.appendChild(s);
   }
   function injectRawStyle() {
     if (document.getElementById('rawDotStyle')) return;
     const s = document.createElement('style'); s.id = 'rawDotStyle';
-    s.textContent = '.raw-dot{width:16px;height:16px;border-radius:50%;background:#6b7280;' +
-      'border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.4);}';
+    // 弱化色原始点(有吸附点时); 无吸附点时切换为鲜明蓝; 手动点击点为弱化橙
+    s.textContent = '.raw-dot{width:16px;height:16px;border-radius:50%;background:#94a3b8;' +
+      'border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.35);}' +
+      '.raw-dot.bright{background:#2563eb;width:22px;height:22px;' +
+      'box-shadow:0 0 0 2px rgba(37,99,235,.5),0 2px 6px rgba(0,0,0,.3);}' +
+      '.raw-dot.manual{background:#fdba74;}';
     document.head.appendChild(s);
   }
 
@@ -858,7 +925,7 @@
     if (linePath.length >= 2) {
       if (!state.trackLine) {
         state.trackLine = new AMap.Polyline({
-          path: linePath, strokeColor: '#2563eb', strokeWeight: 4,
+          path: linePath, strokeColor: '#10b981', strokeWeight: 4, // 绿色虚线，与蓝色/橙色站点标记区分
           strokeOpacity: 0.9, strokeStyle: 'dashed', strokeDasharray: [10, 6],
           lineJoin: 'round', zIndex: 50
         });
@@ -869,9 +936,10 @@
     }
     if (state.collectMarkers.length) { state.map.remove(state.collectMarkers); state.collectMarkers = []; }
     state.collected.forEach((p, i) => {
+      // 站点标记按采集来源分色: 自动(gps)=蓝色系 / 手动(manual)=橙色系
       state.collectMarkers.push(new AMap.Marker({
         position: [p.lng, p.lat], offset: new AMap.Pixel(-9, -9), zIndex: 90,
-        content: '<div class="cp-dot">' + (i + 1) + '</div>',
+        content: '<div class="cp-dot' + (p.source === 'manual' ? ' manual' : '') + '">' + (i + 1) + '</div>',
         title: p.name || ''
       }));
     });
@@ -884,7 +952,9 @@
     const s = document.createElement('style'); s.id = 'cpDotStyle';
     s.textContent = '.cp-dot{min-width:18px;height:18px;padding:0 3px;border-radius:9px;background:#2563eb;' +
       'color:#fff;font-size:11px;font-weight:700;line-height:18px;text-align:center;' +
-      'border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.3);}';
+      'border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.3);}' +
+      // 手动采集站点(橙色系)
+      '.cp-dot.manual{background:#f97316;}';
     document.head.appendChild(s);
   }
 
@@ -994,7 +1064,9 @@
       source: p.manual ? 'manual' : 'gps',
       accuracy: Math.round(p.accuracy || 0),
       alt: state.lastAlt != null ? Math.round(state.lastAlt) : null,
-      raw: state.lastRaw ? { lng: +fmt(state.lastRaw.lng), lat: +fmt(state.lastRaw.lat) } : null,
+      // 原始GPS坐标: 自动模式=芯片上报点; 手动模式=点击点本身
+      raw: p.manual ? { lng: +fmt(p.lng), lat: +fmt(p.lat) }
+        : (state.lastRaw ? { lng: +fmt(state.lastRaw.lng), lat: +fmt(state.lastRaw.lat) } : null),
       time: new Date().toISOString()
     };
     state.collected.push(rec);
@@ -1046,10 +1118,17 @@
   }
   function exportCsv() {
     if (!state.collected.length) { toast('无数据可导出'); return; }
-    const head = 'seq,name,lng,lat,snapped,source,accuracy_m,alt_m,time\n';
-    const rows = state.collected.map((p) =>
-      [p.seq, csvCell(p.name), p.lng, p.lat, p.snapped ? 1 : 0, p.source || 'gps', p.accuracy, p.alt == null ? '' : p.alt, p.time].join(',')
-    ).join('\n');
+    // 同时记录原始GPS坐标与吸附后坐标; 未吸附时吸附列留空
+    const head = 'seq,name,raw_lng,raw_lat,snap_lng,snap_lat,snapped,source,accuracy_m,alt_m,time\n';
+    const rows = state.collected.map((p) => {
+      const raw = p.raw ? p.raw : { lng: p.lng, lat: p.lat }; // 老数据无 raw 字段时回退主坐标
+      const rawLng = raw.lng != null ? raw.lng : '';
+      const rawLat = raw.lat != null ? raw.lat : '';
+      const snapLng = p.snapped ? p.lng : '';
+      const snapLat = p.snapped ? p.lat : '';
+      return [p.seq, csvCell(p.name), rawLng, rawLat, snapLng, snapLat,
+        p.snapped ? 1 : 0, p.source || 'gps', p.accuracy, p.alt == null ? '' : p.alt, p.time].join(',');
+    }).join('\n');
     download('points_' + Date.now() + '.csv', '\ufeff' + head + rows, 'text/csv;charset=utf-8');
     toast('CSV 已导出');
   }
@@ -1114,8 +1193,8 @@
 
     el.btnLocate.addEventListener('click', () => {
       state.followMode = true;
-      if (state.current) state.map.setCenter([state.current.lng, state.current.lat]);
-      toast('已开启位置跟随');
+      fitBoth(true); // 强制适配: 原始GPS点与吸附点同时放入视野
+      toast('已开启位置跟随(视野同时包含原始点与吸附点)');
     });
 
     el.btnMenu.addEventListener('click', () => toggleSheet(true));

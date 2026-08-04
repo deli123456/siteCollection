@@ -292,15 +292,18 @@ html, body {
   padding: 40px 0;
 }
 
-/* Toast */
+/* Toast(顶部居中，避免遮挡地图中心视野) */
 .toast {
   position: fixed;
   left: 50%;
-  top: 50%;
-  transform: translate(-50%, -50%);
+  top: 64px;
+  transform: translateX(-50%);
   z-index: 100;
-  background: rgba(0,0,0,0.8);
+  background: rgba(0,0,0,0.55);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
   color: #fff;
+  text-shadow: 0 1px 2px rgba(0,0,0,0.5);
   padding: 12px 20px;
   border-radius: 10px;
   font-size: 14px;
